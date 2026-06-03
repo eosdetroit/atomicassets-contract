@@ -1864,48 +1864,51 @@ void atomicassets::internal_decrease_balance(
 * This ends up being a rather significant performance pitfall, as it's an unnecessary CPU tax when interacting with AtomicAssets
 * The solution below utilizes low level host functions to perform a partial memory read to directly access a set amount of bytes for increased CPU performance
 
-* General Bytes Math = 
-    + 128               // Row + uin64_t collection_name Primary Key, will always be 128
-    + 8 + 1 + 8         // For author, allow_notify & market_fee, will always be 17
-    + 1 + 1 + 2         // For authorized_accounts, notify_accounts & serialized_data, the size of the vector itself is dependant on the number of elements, will be 4 (to be safe). <255 = 1, <65565 = 2, etc.
-    + (8 * R={1|48})    // 8 Bytes for each element in the notify_accounts & authorized_accounts, up to 24 for each, total ranging from 8 = 384
+* IMPORTANT: db_get_i64 returns ONLY the serialized row payload — the bytes begin
+* at the first struct field (collection_name). There is NO 128-byte row / primary-key
+* prefix in the returned bytes. Earlier revisions of this comment assumed a phantom
+* +128 prefix, which over-stated the available cushion and is the reason the auth
+* read window below was mis-sized.
 
-* Total Bytes R={157|533}     
-* The upper limit of 533 can be used to "Safely" capture all data, except serialized data, accepting an upper limit of up to 48 notify/authorized accounts
-
-* In practice, this can be further reduced, as the fields in the row are deserialized sequentially & we only care about the specific vector <name> fields
+* collections_s serializes its fields sequentially:
 
     TABLE collections_s {
-        name             collection_name;
-        name             author;
-        bool             allow_notify;
-        vector <name>    authorized_accounts;
-        vector <name>    notify_accounts;
+        name             collection_name;     // 8
+        name             author;              // 8
+        bool             allow_notify;        // 1
+        vector <name>    authorized_accounts; // 1 (size varint, <=127 elems) + 8*N
+        vector <name>    notify_accounts;     // 1 (size varint)              + 8*M
 
         *********************************
-        Everything below here can be safely ignored for this process
+        Everything below here is not needed here and may be safely truncated
         *********************************
 
-        double           market_fee; 
-        vector <uint8_t> serialized_data;
+        double           market_fee;          // 8
+        vector <uint8_t> serialized_data;     // varint + blob, can be several KB
 
         uint64_t primary_key() const { return collection_name.value; };
     };
 
-* Authorized Bytes Math = 
-    + 128               // Row + uint64_t collection_name Primary Key
-    + 8 + 1             // For author & allow_notify, will always be 9
-    + 1 + (8 * R={1|24})// authorized_accounts vector + 8 Bytes for each element, up to 24, total ranging from 1 + (8 to 192)
+* Each path deserializes the fields in order and MUST stop at the vector it returns
+* (see the early return in the function below):
 
-* Total Bytes R={146|330}
+*   Authorized path (type=false): read THROUGH authorized_accounts only
+*     = 8 + 8 + 1 + (1 + 8*N),                 N<=24  ->  max 210 bytes  (buffer 330, ample)
 
-* Notify Bytes Math = 
-    + 128               // Row + uint64_t collection_name Primary Key
-    + 8 + 1             // For author & allow_notify, will always be 9
-    + 2                 // authorized_accounts + notify_accounts vectors = 2
-    + (8 * R={25|48})   // Assuming max authorized_accounts, 8 Bytes for each element in authorized_accounts & notify_accounts, up to 24, total ranging from 200 to 384
+*   Notify path (type=true): read THROUGH notify_accounts
+*     = 8 + 8 + 1 + (1 + 8*N) + (1 + 8*M),     N,M<=24 -> max 403 bytes  (buffer 523, ample)
 
-* Total Bytes R={339|523}
+* CAVEAT: the N,M<=24 worst cases above are enforced by addcolauth / addnotifyacc, but NOT by
+* createcol, which writes both vectors verbatim with no size check. A single createcol with very
+* large vectors can still exceed these budgets (auth overflows once authorized > ~39; notify once
+* N+M > 63). Capping the vectors in createcol (or sizing the read off data_size) would close that
+* residual gap — tracked separately; it is pre-existing and not introduced by this change.
+
+* The auth path must NOT deserialize notify_accounts: with only the 330-byte auth
+* buffer, `ds >> notify_accounts` reads past the truncated buffer once the combined
+* account count is large (empirically N+M > 38) and throws "datastream attempted to
+* read past the end", bricking every check_has_collection_auth caller for that
+* collection. The early return below prevents that.
 
 */
 
@@ -1934,13 +1937,19 @@ vector<name> atomicassets::partial_read_collection(
     ds >> author;
     ds >> allow_notify;
     ds >> authorized_accounts;
-    ds >> notify_accounts;
-    
-    if (!type){
+
+    // The auth path only needs authorized_accounts and MUST return before reading
+    // notify_accounts: the 330-byte auth buffer is sized to reach the end of
+    // authorized_accounts (<=210 bytes), NOT the end of notify_accounts. Reading
+    // notify_accounts here would overflow the truncated buffer for collections with
+    // many combined authorized+notify accounts and throw. The notify path uses the
+    // larger 523-byte buffer, which holds through notify_accounts (<=403 bytes).
+    if (!type) {
         return authorized_accounts;
-    } else {
-        return notify_accounts;
     }
+
+    ds >> notify_accounts;
+    return notify_accounts;
 }
 
 /**
