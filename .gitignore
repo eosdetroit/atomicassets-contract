@@ -3,4 +3,5 @@
 .eosproj
 .DS_STORE
 
-.idea
+.ideanode_modules/
+build/
